@@ -76,6 +76,8 @@ class kNNGraph(DataGraph):
         distance="euclidean",
         thresh=1e-4,
         n_pca=None,
+        use_pynndescent=False,
+        # pynndescent_kwgs=dict(), #TODO for additional control, random_state, etc.
         **kwargs
     ):
 
@@ -129,6 +131,7 @@ class kNNGraph(DataGraph):
         self.bandwidth_scale = bandwidth_scale
         self.distance = distance
         self.thresh = thresh
+        self.use_pynndescent = use_pynndescent
         super().__init__(data, n_pca=n_pca, **kwargs)
 
     def get_params(self):
@@ -221,28 +224,73 @@ class kNNGraph(DataGraph):
         try:
             return self._knn_tree
         except AttributeError:
-            try:
-                self._knn_tree = NearestNeighbors(
-                    n_neighbors=self.knn + 1,
-                    algorithm="ball_tree",
-                    metric=self.distance,
-                    n_jobs=self.n_jobs,
-                ).fit(self.data_nu)
-            except ValueError:
-                # invalid metric
-                warnings.warn(
-                    "Metric {} not valid for `sklearn.neighbors.BallTree`. "
-                    "Graph instantiation may be slower than normal.".format(
-                        self.distance
-                    ),
-                    UserWarning,
-                )
-                self._knn_tree = NearestNeighbors(
-                    n_neighbors=self.knn + 1,
-                    algorithm="auto",
-                    metric=self.distance,
-                    n_jobs=self.n_jobs,
-                ).fit(self.data_nu)
+            if self.use_pynndescent:
+                try:
+                    from pynndescent import NNDescent
+
+                    class _NNDescent(NNDescent):
+                        def __init__(
+                            self,
+                            data,
+                            metric=self.distance,
+                            n_neighbors=self.knn,
+                            n_jobs=self.n_jobs
+                            ):
+                            super().__init__(
+                                data,
+                                metric=metric,
+                                n_neighbors=n_neighbors,
+                                n_jobs=n_jobs
+                                )
+
+                        def kneighbors_graph(self, *args, n_neighbors, **kwargs):
+                            indices,_ = self.neighbor_graph
+                            return scipy.sparse.csr_matrix(
+                                np.ones(indices.shape[0]*n_neighbors,),
+                                (np.repeat(indices[:,0],n_neighbors),
+                                    indices[:,:n_neighbors].reshape(-1))
+                                )
+
+                        def kneighbors(self, *args, n_neighbors, **kwargs):
+                            indices,distances = self.query(*args, k=n_neighbors, **kwargs)
+                            return distances, indices
+
+
+                except ImportEror:
+                    raise ValueError(
+                        "Cannot import PyNNDescent. "
+                        "Set use_pynndescent = False or install PyNNDescent.")
+                
+                if self.knn_max is None:
+                    knn_max = self.data_nu.shape[0]
+
+                search_knn = min(self.knn * self.search_multiplier, knn_max)
+
+                self._knn_tree = _NNDescent(self.data_nu,n_neighbors=search_knn)
+
+            else:
+                try:
+                    self._knn_tree = NearestNeighbors(
+                        n_neighbors=self.knn + 1,
+                        algorithm="ball_tree",
+                        metric=self.distance,
+                        n_jobs=self.n_jobs,
+                    ).fit(self.data_nu)
+                except ValueError:
+                    # invalid metric
+                    warnings.warn(
+                        "Metric {} not valid for `sklearn.neighbors.BallTree`. "
+                        "Graph instantiation may be slower than normal.".format(
+                            self.distance
+                        ),
+                        UserWarning,
+                    )
+                    self._knn_tree = NearestNeighbors(
+                        n_neighbors=self.knn + 1,
+                        algorithm="auto",
+                        metric=self.distance,
+                        n_jobs=self.n_jobs,
+                    ).fit(self.data_nu)
             return self._knn_tree
 
     def build_kernel(self):
@@ -379,10 +427,16 @@ class kNNGraph(DataGraph):
                 # increase the knn search
                 search_knn = min(search_knn * self.search_multiplier, knn_max)
                 while (
-                    len(update_idx) > Y.shape[0] // 10
-                    and search_knn < self.data_nu.shape[0] / 2
+                    ((
+                        len(update_idx) > Y.shape[0] // 10 
+                        and search_knn < self.data_nu.shape[0] / 2
+                        )
+                    # radius_neighbors not possible with pynndescent and large searches should be feasible
+                    or (len(update_idx)>0 & self.use_pynndescent)
+                    )
                     and search_knn < knn_max
                 ):
+                    print(f'remaining queries to complete: {len(update_idx)}, with current query size of {search_knn}')
                     dist_new, ind_new = knn_tree.kneighbors(
                         Y[update_idx], n_neighbors=search_knn
                     )
