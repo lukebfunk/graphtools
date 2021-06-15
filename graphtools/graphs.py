@@ -253,7 +253,7 @@ class kNNGraph(DataGraph):
                             return distances, indices
 
 
-                except ImportEror:
+                except ImportError:
                     raise ValueError(
                         "Cannot import PyNNDescent. "
                         "Set use_pynndescent = False or install PyNNDescent.")
