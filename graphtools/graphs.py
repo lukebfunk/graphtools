@@ -270,7 +270,7 @@ class kNNGraph(DataGraph):
                     random_state=self.random_state,
                     n_jobs=self.n_jobs,
                     compressed=False,
-                    verbose=self.verbose
+                    verbose=self.verbose,
                     **self.pynndescent_kwargs
                 )
 
