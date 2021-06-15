@@ -77,7 +77,7 @@ class kNNGraph(DataGraph):
         thresh=1e-4,
         n_pca=None,
         use_pynndescent=False,
-        # pynndescent_kwgs=dict(), #TODO for additional control, random_state, etc.
+        pynndescent_kwargs=dict(),
         **kwargs
     ):
 
@@ -132,6 +132,7 @@ class kNNGraph(DataGraph):
         self.distance = distance
         self.thresh = thresh
         self.use_pynndescent = use_pynndescent
+        self.pynndescent_kwargs = pynndescent_kwargs
         super().__init__(data, n_pca=n_pca, **kwargs)
 
     def get_params(self):
@@ -232,15 +233,11 @@ class kNNGraph(DataGraph):
                         def __init__(
                             self,
                             data,
-                            metric=self.distance,
-                            n_neighbors=self.knn,
-                            n_jobs=self.n_jobs
+                            **kwargs
                             ):
                             super().__init__(
                                 data,
-                                metric=metric,
-                                n_neighbors=n_neighbors,
-                                n_jobs=n_jobs
+                                **kwargs
                                 )
 
                         def kneighbors_graph(self, *args, n_neighbors, **kwargs):
@@ -266,7 +263,16 @@ class kNNGraph(DataGraph):
 
                 search_knn = min(self.knn * self.search_multiplier, knn_max)
 
-                self._knn_tree = _NNDescent(self.data_nu,n_neighbors=search_knn)
+                self._knn_tree = _NNDescent(
+                    self.data_nu,
+                    metric=self.distance,
+                    n_neighbors=search_knn,
+                    random_state=self.random_state,
+                    n_jobs=self.n_jobs,
+                    compressed=False,
+                    verbose=self.verbose
+                    **self.pynndescent_kwargs
+                )
 
             else:
                 try:
