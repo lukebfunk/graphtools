@@ -55,6 +55,16 @@ class kNNGraph(DataGraph):
         All affinities below `thresh` will be set to zero in order to save
         on time and memory constraints.
 
+    use_pynndescent : `bool`, optional (default: `False`)
+        Whether to use PyNNDescent for computing the graph. Scales better
+        to large graphs, but is an approximation algorithm. If using a very
+        large graph, may be helpful to set
+        `knn_max` <= ((`knn`+1)*`search_multiplier`)
+
+    pynndescent_kwargs : `dict`, optional (default: empty `dict`)
+        Arguments to pass to the `pynndescent.NNDescent` constructor. If
+        `epsilon` is a key, this is passed to the `query` method.
+
     Attributes
     ----------
 
@@ -78,7 +88,7 @@ class kNNGraph(DataGraph):
         n_pca=None,
         use_pynndescent=False,
         pynndescent_kwargs=dict(),
-        **kwargs
+        **kwargs,
     ):
 
         if decay is not None:
@@ -132,12 +142,12 @@ class kNNGraph(DataGraph):
         self.distance = distance
         self.thresh = thresh
         self.use_pynndescent = use_pynndescent
+        self.epsilon = pynndescent_kwargs.pop("epsilon", 0.1)
         self.pynndescent_kwargs = pynndescent_kwargs
         super().__init__(data, n_pca=n_pca, **kwargs)
 
     def get_params(self):
-        """Get parameters from this object
-        """
+        """Get parameters from this object"""
         params = super().get_params()
         params.update(
             {
@@ -233,35 +243,77 @@ class kNNGraph(DataGraph):
                         def __init__(
                             self,
                             data,
-                            **kwargs
-                            ):
+                            metric="euclidean",
+                            n_neighbors=self.knn,
+                            **kwargs,
+                        ):
                             super().__init__(
-                                data,
-                                **kwargs
-                                )
+                                data, metric=metric, n_neighbors=n_neighbors, **kwargs
+                            )
 
-                        def kneighbors_graph(self, *args, n_neighbors, **kwargs):
-                            indices,_ = self.neighbor_graph
-                            return scipy.sparse.csr_matrix(
-                                np.ones(indices.shape[0]*n_neighbors,),
-                                (np.repeat(indices[:,0],n_neighbors),
-                                    indices[:,:n_neighbors].reshape(-1))
+                        def get_query_mask(self, X):
+                            return (
+                                np.isin(self._raw_data, X.astype(np.float32)).sum(
+                                    axis=1
                                 )
+                                == X.shape[1]
+                            )
 
-                        def kneighbors(self, *args, n_neighbors, **kwargs):
-                            indices,distances = self.query(*args, k=n_neighbors, **kwargs)
+                        def kneighbors_graph(
+                            self,
+                            X,
+                            n_neighbors,
+                            epsilon=self.epsilon,
+                            mode="connectivity",
+                        ):
+                            if n_neighbors <= self.n_neighbors:
+                                if np.array_equal(X.astype(np.float32), self._raw_data):
+                                    indices, _ = self.neighbor_graph
+                                else:
+                                    query_mask = self.get_query_mask(X)
+                                    indices = self.neighbor_graph[0][query_mask]
+                            else:
+                                indices, _ = self.query(
+                                    X, k=n_neighbors, epsilon=epsilon
+                                )
+                            return sparse.csr_matrix(
+                                (
+                                    np.ones(
+                                        indices.shape[0] * n_neighbors, dtype=np.int64
+                                    ),
+                                    (
+                                        np.repeat(indices[:, 0], n_neighbors),
+                                        indices[:, :n_neighbors].reshape(-1),
+                                    ),
+                                )
+                            )
+
+                        def kneighbors(self, X, n_neighbors, epsilon=self.epsilon):
+                            # initializing the search function is not parallelized and expensive for large graphs
+                            # in this use case, query data is always a subset of original data
+                            # suggested to used knn_max <= ((knn+1)*search_multiplier) for very large graphs
+                            if n_neighbors <= self.n_neighbors:
+                                if np.array_equal(X.astype(np.float32), self._raw_data):
+                                    indices, distances = self.neighbor_graph
+                                else:
+                                    query_mask = self.get_query_mask(X)
+                                    indices, distances = map(
+                                        lambda x: x[query_mask], self.neighbor_graph
+                                    )
+                            else:
+                                indices, distances = self.query(
+                                    X, k=n_neighbors, epsilon=epsilon
+                                )
                             return distances, indices
-
 
                 except ImportError:
                     raise ValueError(
                         "Cannot import PyNNDescent. "
-                        "Set use_pynndescent = False or install PyNNDescent.")
-                
-                if self.knn_max is None:
-                    knn_max = self.data_nu.shape[0]
+                        "Set use_pynndescent = False or install PyNNDescent."
+                    )
 
-                search_knn = min(self.knn * self.search_multiplier, knn_max)
+                knn_max = self.knn_max + 1 if self.knn_max else None
+                search_knn = min(((self.knn + 1) * self.search_multiplier) + 1, knn_max)
 
                 self._knn_tree = _NNDescent(
                     self.data_nu,
@@ -271,7 +323,7 @@ class kNNGraph(DataGraph):
                     n_jobs=self.n_jobs,
                     compressed=False,
                     verbose=self.verbose,
-                    **self.pynndescent_kwargs
+                    **self.pynndescent_kwargs,
                 )
 
             else:
@@ -433,16 +485,16 @@ class kNNGraph(DataGraph):
                 # increase the knn search
                 search_knn = min(search_knn * self.search_multiplier, knn_max)
                 while (
-                    ((
-                        len(update_idx) > Y.shape[0] // 10 
+                    (
+                        len(update_idx) > Y.shape[0] // 10
                         and search_knn < self.data_nu.shape[0] / 2
-                        )
-                    # radius_neighbors not possible with pynndescent and large searches should be feasible
-                    or (len(update_idx)>0 & self.use_pynndescent)
                     )
-                    and search_knn < knn_max
-                ):
-                    print(f'remaining queries to complete: {len(update_idx)}, with current query size of {search_knn}')
+                    # radius_neighbors not possible with pynndescent and large searches should be feasible
+                    or (len(update_idx) > 0 & self.use_pynndescent)
+                ) and search_knn < knn_max:
+                    print(
+                        f"remaining queries to complete: {len(update_idx)}, with current query size of {search_knn}"
+                    )
                     dist_new, ind_new = knn_tree.kneighbors(
                         Y[update_idx], n_neighbors=search_knn
                     )
@@ -584,8 +636,7 @@ class LandmarkGraph(DataGraph):
         super().__init__(data, **kwargs)
 
     def get_params(self):
-        """Get parameters from this object
-        """
+        """Get parameters from this object"""
         params = super().get_params()
         params.update({"n_landmark": self.n_landmark, "n_pca": self.n_pca})
         return params
@@ -894,7 +945,7 @@ class TraditionalGraph(DataGraph):
         n_pca=None,
         thresh=1e-4,
         precomputed=None,
-        **kwargs
+        **kwargs,
     ):
         if decay is None and precomputed not in ["affinity", "adjacency"]:
             # decay high enough is basically a binary kernel
@@ -946,8 +997,7 @@ class TraditionalGraph(DataGraph):
         super().__init__(data, n_pca=n_pca, **kwargs)
 
     def get_params(self):
-        """Get parameters from this object
-        """
+        """Get parameters from this object"""
         params = super().get_params()
         params.update(
             {
@@ -1238,7 +1288,7 @@ class MNNGraph(DataGraph):
         distance="euclidean",
         thresh=1e-4,
         n_jobs=1,
-        **kwargs
+        **kwargs,
     ):
         self.beta = beta
         self.sample_idx = sample_idx
@@ -1282,8 +1332,7 @@ class MNNGraph(DataGraph):
             super()._check_symmetrization(kernel_symm, theta)
 
     def get_params(self):
-        """Get parameters from this object
-        """
+        """Get parameters from this object"""
         params = super().get_params()
         params.update(
             {
